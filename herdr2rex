@@ -2,7 +2,7 @@
 """Import herdr workspaces into Rex.
 
 herdr workspace -> Rex session, herdr tab -> Rex window, herdr pane -> Rex block.
-Panes that held a Claude session run `claude --resume <id>` in their shell.
+Panes that held an agent session resume it in their shell, the same way herdr does.
 Workspaces whose label already exists in Rex are skipped.
 """
 import argparse
@@ -18,6 +18,26 @@ REX_DEFAULT = os.path.expanduser(
     "~/Library/Application Support/com.superlogical.rex/RexServer/Versions/Current/Rex Server.app/Contents/MacOS/rex"
 )
 DIRECTIONS = {"Horizontal": "right", "Vertical": "below"}
+# Copied from herdr's src/agent_resume.rs. Keys are the saved agent_session source.
+RESUME = {
+    "herdr:claude": "claude --resume {}",
+    "herdr:codex": "codex resume {}",
+    "herdr:copilot": "copilot --resume={}",
+    "herdr:devin": "devin --resume {}",
+    "herdr:droid": "droid --resume {}",
+    "herdr:kimi": "kimi --session {}",
+    "herdr:mastracode": "mastracode --thread {}",
+    "herdr:pi": "pi --session {}",
+    "herdr:omp": "omp --resume={}",
+    "herdr:hermes": "hermes --resume {}",
+    "herdr:opencode": "opencode --session {}",
+    "herdr:qodercli": "qodercli --resume {}",
+    "herdr:qwen": "qwen --resume {}",
+    "herdr:kilo": "kilo --session {}",
+    "herdr:cursor": "cursor-agent --resume {}",
+    "herdr:antigravity_cli": "agy --conversation {}",
+    "herdr:grok": "grok --resume {}",
+}
 
 
 def first_pane(node):
@@ -69,8 +89,9 @@ class Importer:
     def build(self, node, block, session, panes):
         if "Pane" in node:
             agent = panes[str(node["Pane"])].get("agent_session") or {}
-            if agent.get("agent") == "claude" and agent.get("kind") == "id":
-                self.call("send", "-s", session, "-b", block, f"claude --resume {agent['value']}\n")
+            command = RESUME.get(agent.get("source"))
+            if command:
+                self.call("send", "-s", session, "-b", block, command.format(shlex.quote(agent["value"])) + "\n")
             return
         split = node["Split"]
         cwd = panes[str(first_pane(split["second"]))]["cwd"]
