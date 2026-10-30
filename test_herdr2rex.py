@@ -1,4 +1,5 @@
-"""End-to-end test. Needs a running Rex server. Creates and kills one Rex session."""
+"""End-to-end tests. They need a running Rex server. Each test creates and kills one Rex session."""
+import copy
 import json
 import os
 import shutil
@@ -51,12 +52,16 @@ def rex(*args):
     return subprocess.run([REX, *args], check=True, capture_output=True, text=True).stdout
 
 
+def inspect():
+    return json.loads(rex("session", "inspect", LABEL, "--json"))
+
+
 class ImportTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.fixture = os.path.join(self.tmp.name, "session.json")
-        with open(self.fixture, "w") as f:
-            json.dump(FIXTURE, f)
+        self.state = os.path.join(self.tmp.name, "state")
+        self.write_fixture(FIXTURE)
         herdr = os.path.join(self.tmp.name, "herdr")
         with open(herdr, "w") as f:
             f.write(f"#!/bin/sh\necho '{json.dumps(HERDR_PANES)}'\n")
@@ -66,8 +71,12 @@ class ImportTest(unittest.TestCase):
         self.tmp.cleanup()
         subprocess.run([REX, "kill", LABEL], capture_output=True)
 
+    def write_fixture(self, data):
+        with open(self.fixture, "w") as f:
+            json.dump(data, f)
+
     def run_import(self):
-        env = {**os.environ, "PATH": f"{self.tmp.name}:{os.environ['PATH']}"}
+        env = {**os.environ, "PATH": f"{self.tmp.name}:{os.environ['PATH']}", "XDG_STATE_HOME": self.state}
         return subprocess.run([os.path.join(HERE, "herdr2rex"), "--from", self.fixture],
                               env=env, check=True, capture_output=True, text=True).stdout
 
@@ -79,8 +88,7 @@ class ImportTest(unittest.TestCase):
 
     def test_import(self):
         self.assertIn(f"imported {LABEL}", self.run_import())
-        inspected = json.loads(rex("session", "inspect", LABEL, "--json"))
-        main, second = inspected["windows"]
+        main, second = inspect()["windows"]
 
         self.assertEqual(main["label"], "main")
         layer = main["layers"][0]
@@ -102,6 +110,39 @@ class ImportTest(unittest.TestCase):
         self.assertEqual(labels[inner["before"]["block_id"]], TITLE)
         self.assertEqual(labels[inner["after"]["block_id"]], "shell")
 
+        self.assertIn(f"{LABEL} is up to date", self.run_import())
+
+    def test_rerun_adds_new_panes_and_tabs(self):
+        self.run_import()
+        changed = copy.deepcopy(FIXTURE)
+        tabs = changed["workspaces"][0]["tabs"]
+        tabs[1]["layout"] = {"Split": {"direction": "Vertical", "ratio": 0.6, "first": {"Pane": 4}, "second": {"Pane": 5}}}
+        tabs[1]["panes"]["5"] = {"cwd": "/tmp"}
+        tabs.append({"custom_name": "logs", "layout": {"Pane": 6}, "panes": {"6": {"cwd": "/tmp"}}})
+        self.write_fixture(changed)
+
+        self.assertIn(f"added 2 panes to {LABEL}", self.run_import())
+        windows = inspect()["windows"]
+        self.assertEqual(len(windows), 3)
+        split = windows[1]["layers"][0]["layout"]["split"]
+        self.assertEqual(split["direction"], "vertical")
+        self.assertAlmostEqual(split["ratio"], 0.6)
+        self.assertEqual(windows[2]["label"], "logs")
+
+    def test_rerun_restores_a_closed_block(self):
+        self.run_import()
+        inner = inspect()["windows"][0]["layers"][0]["layout"]["split"]["before"]["split"]
+        rex("block", "close", "-s", LABEL, inner["before"]["block_id"])
+
+        self.assertIn(f"added 1 pane to {LABEL}", self.run_import())
+        restored = inspect()["windows"][0]["layers"][0]["layout"]["split"]["before"]["split"]
+        self.assertEqual(restored["direction"], "vertical")
+        self.assertAlmostEqual(restored["ratio"], 0.7)
+        self.assertEqual(restored["after"]["block_id"], inner["after"]["block_id"])
+
+    def test_skips_a_session_it_did_not_create(self):
+        self.run_import()
+        self.state = os.path.join(self.tmp.name, "other-state")
         self.assertIn(f"skip {LABEL}", self.run_import())
 
 

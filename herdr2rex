@@ -3,7 +3,7 @@
 
 herdr workspace -> Rex session, herdr tab -> Rex window, herdr pane -> Rex block.
 Panes that held an agent session resume it in their shell, the same way herdr does.
-Workspaces whose label already exists in Rex are skipped.
+Run it again to add the panes and tabs that are missing in Rex.
 """
 import argparse
 import json
@@ -17,7 +17,9 @@ HERDR_SESSION = os.path.expanduser("~/.config/herdr/session.json")
 REX_DEFAULT = os.path.expanduser(
     "~/Library/Application Support/com.superlogical.rex/RexServer/Versions/Current/Rex Server.app/Contents/MacOS/rex"
 )
+STATE = os.path.join(os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state"), "herdr2rex", "state.json")
 DIRECTIONS = {"Horizontal": "right", "Vertical": "below"}
+OPPOSITE = {"right": "left", "below": "above"}
 # Copied from herdr's src/agent_resume.rs. Keys are the saved agent_session source.
 RESUME = {
     "herdr:claude": "claude --resume {}",
@@ -66,6 +68,10 @@ class Importer:
         self.fake_ids = 0
         self.titles = herdr_titles()
 
+    def query(self, *args):
+        out = subprocess.run([self.rex, *args, "--json"], check=True, capture_output=True, text=True).stdout
+        return json.loads(out)
+
     def call(self, *args):
         if self.dry_run:
             print("rex " + shlex.join(args).replace("\n", "\\n"))
@@ -78,46 +84,97 @@ class Importer:
         return json.loads(out) if "--json" in args else None
 
     def existing_labels(self):
-        out = subprocess.run([self.rex, "ls", "--json"], check=True, capture_output=True, text=True).stdout
-        return {s["label"] for s in json.loads(out)["sessions"]}
+        return {s["label"] for s in self.query("ls")["sessions"]}
 
-    def import_workspace(self, ws):
-        label = workspace_label(ws)
-        session = None
+    def live_blocks(self, session):
+        """Block IDs in a Rex session, or None if the session is gone."""
+        try:
+            info = self.query("session", "inspect", session)
+        except subprocess.CalledProcessError:
+            return None
+        return {b["block_id"] for w in info["windows"] for layer in w["layers"] for b in layer["blocks"]}
+
+    def sync_workspace(self, ws, entry, live):
+        """Create every pane of ws that has no live block in Rex. Returns how many were created."""
+        self.entry = entry
+        self.panes = {k: v for tab in ws["tabs"] for k, v in tab["panes"].items()}
+        self.added = 0
         for tab in ws["tabs"]:
-            panes = tab["panes"]
-            cwd = panes[str(first_pane(tab["layout"]))]["cwd"]
-            name = [tab["custom_name"]] if tab.get("custom_name") else []
-            if session is None:
-                window = ["--window", *name] if name else []
-                res = self.call("new", label, *window, "-c", cwd, "--json")
-                session = res["session_id"]
-                block = res["initial_windows"][0]["block_ids"][0]
-            else:
-                res = self.call("window", "new", "-s", session, *name, "-c", cwd, "--focus=false", "--json")
-                block = res["block_ids"][0]
-            self.build(tab["layout"], block, session, panes)
+            if self.sync(tab["layout"], live) is None:
+                self.new_window(ws, tab)
+        entry["blocks"] = {k: v for k, v in entry["blocks"].items() if k in self.panes}
+        return self.added
 
-    def build(self, node, block, session, panes):
+    def new_window(self, ws, tab):
+        cwd = self.panes[str(first_pane(tab["layout"]))]["cwd"]
+        name = [tab["custom_name"]] if tab.get("custom_name") else []
+        if self.entry["session"] is None:
+            window = ["--window", *name] if name else []
+            res = self.call("new", workspace_label(ws), *window, "-c", cwd, "--json")
+            self.entry["session"] = res["session_id"]
+            block = res["initial_windows"][0]["block_ids"][0]
+        else:
+            res = self.call("window", "new", "-s", self.entry["session"], *name, "-c", cwd, "--focus=false", "--json")
+            block = res["block_ids"][0]
+        self.build(tab["layout"], block)
+
+    def sync(self, node, live):
+        """Add the missing parts of node next to its live blocks. Returns a live block in node, or None."""
         if "Pane" in node:
-            agent = panes[str(node["Pane"])].get("agent_session") or {}
-            title = self.titles.get(agent.get("value"))
-            if title:
-                self.call("block", "rename", "-s", session, "--", block, title)
-            command = RESUME.get(agent.get("source"))
-            if command:
-                self.call("send", "-s", session, "-b", block, command.format(shlex.quote(agent["value"])) + "\n")
+            block = self.entry["blocks"].get(str(node["Pane"]))
+            return block if block in live else None
+        split = node["Split"]
+        first = self.sync(split["first"], live)
+        second = self.sync(split["second"], live)
+        direction = DIRECTIONS[split["direction"]]
+        if first and not second:
+            self.add(split["second"], first, direction, 1 - split["ratio"])
+        elif second and not first:
+            self.add(split["first"], second, OPPOSITE[direction], split["ratio"])
+        return first or second
+
+    def build(self, node, block):
+        """Create the whole layout of node. block already hosts its first pane."""
+        if "Pane" in node:
+            self.start(str(node["Pane"]), block)
             return
         split = node["Split"]
-        cwd = panes[str(first_pane(split["second"]))]["cwd"]
+        self.add(split["second"], block, DIRECTIONS[split["direction"]], 1 - split["ratio"])
+        self.build(split["first"], block)
+
+    def add(self, node, anchor, direction, share):
+        cwd = self.panes[str(first_pane(node))]["cwd"]
         res = self.call(
-            "split", "-s", session, "-b", block,
-            "--split", DIRECTIONS[split["direction"]],
-            "--ratio", str(round((1 - split["ratio"]) * 100)),
-            "-c", cwd, "--focus=false", "--json",
+            "split", "-s", self.entry["session"], "-b", anchor, "--split", direction,
+            "--ratio", str(round(share * 100)), "-c", cwd, "--focus=false", "--json",
         )
-        self.build(split["first"], block, session, panes)
-        self.build(split["second"], res["block_ids"][0], session, panes)
+        self.build(node, res["block_ids"][0])
+
+    def start(self, pane, block):
+        self.entry["blocks"][pane] = block
+        self.added += 1
+        session = self.entry["session"]
+        agent = self.panes[pane].get("agent_session") or {}
+        title = self.titles.get(agent.get("value"))
+        if title:
+            self.call("block", "rename", "-s", session, "--", block, title)
+        command = RESUME.get(agent.get("source"))
+        if command:
+            self.call("send", "-s", session, "-b", block, command.format(shlex.quote(agent["value"])) + "\n")
+
+
+def load_state():
+    try:
+        with open(STATE) as f:
+            return json.load(f)
+    except FileNotFoundError:
+        return {}
+
+
+def save_state(state):
+    os.makedirs(os.path.dirname(STATE), exist_ok=True)
+    with open(STATE, "w") as f:
+        json.dump(state, f, indent=2)
 
 
 def main():
@@ -130,21 +187,36 @@ def main():
     with open(args.source) as f:
         herdr = json.load(f)
     importer = Importer(shutil.which("rex") or REX_DEFAULT, args.dry_run)
-    existing = set() if args.dry_run else importer.existing_labels()
+    existing = importer.existing_labels()
+    state = load_state()
 
     for ws in herdr["workspaces"]:
         label = workspace_label(ws)
         if args.workspaces and label not in args.workspaces:
             continue
-        if label in existing:
-            print(f"skip {label}: already in Rex")
-            continue
+        entry = state.get(ws["id"])
+        live = importer.live_blocks(entry["session"]) if entry else None
+        if live is None:
+            if label in existing:
+                print(f"skip {label}: Rex already has a session with this name")
+                continue
+            entry, live = {"session": None, "blocks": {}}, set()
+        new = entry["session"] is None
         try:
-            importer.import_workspace(ws)
+            added = importer.sync_workspace(ws, entry, live)
         except subprocess.CalledProcessError as e:
             sys.exit(f"failed on {label}: {e.stderr.strip()}")
+        finally:
+            if entry["session"] and not args.dry_run:
+                state[ws["id"]] = entry
+                save_state(state)
         existing.add(label)
-        print(f"{'would import' if args.dry_run else 'imported'} {label}")
+        if new:
+            print(f"{'would import' if args.dry_run else 'imported'} {label}")
+        elif added:
+            print(f"{'would add' if args.dry_run else 'added'} {added} pane{'' if added == 1 else 's'} to {label}")
+        else:
+            print(f"{label} is up to date")
 
 
 if __name__ == "__main__":
