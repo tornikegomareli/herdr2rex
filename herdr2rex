@@ -48,11 +48,23 @@ def workspace_label(ws):
     return ws.get("custom_name") or os.path.basename(ws["identity_cwd"])
 
 
+def herdr_titles():
+    """Map agent session value -> pane title from the running herdr. Empty if herdr is not running."""
+    try:
+        out = subprocess.run(["herdr", "pane", "list"], check=True, capture_output=True, text=True).stdout
+    except (OSError, subprocess.CalledProcessError):
+        return {}
+    return {p["agent_session"]["value"]: p["terminal_title_stripped"]
+            for p in json.loads(out)["result"]["panes"]
+            if p.get("agent_session") and p.get("terminal_title_stripped")}
+
+
 class Importer:
     def __init__(self, rex, dry_run):
         self.rex = rex
         self.dry_run = dry_run
         self.fake_ids = 0
+        self.titles = herdr_titles()
 
     def call(self, *args):
         if self.dry_run:
@@ -89,6 +101,9 @@ class Importer:
     def build(self, node, block, session, panes):
         if "Pane" in node:
             agent = panes[str(node["Pane"])].get("agent_session") or {}
+            title = self.titles.get(agent.get("value"))
+            if title:
+                self.call("block", "rename", "-s", session, "--", block, title)
             command = RESUME.get(agent.get("source"))
             if command:
                 self.call("send", "-s", session, "-b", block, command.format(shlex.quote(agent["value"])) + "\n")

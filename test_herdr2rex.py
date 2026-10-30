@@ -13,6 +13,9 @@ REX = shutil.which("rex") or os.path.expanduser(
 )
 LABEL = "zz-herdr2rex-test"
 CLAUDE_ID = "00000000-0000-0000-0000-000000000000"
+TITLE = "Fix the login bug"
+# What the fake `herdr pane list` prints: a live title for the first agent pane only.
+HERDR_PANES = {"result": {"panes": [{"agent_session": {"value": CLAUDE_ID}, "terminal_title_stripped": TITLE}]}}
 
 
 def session(agent, value):
@@ -50,17 +53,23 @@ def rex(*args):
 
 class ImportTest(unittest.TestCase):
     def setUp(self):
-        fd, self.fixture = tempfile.mkstemp(suffix=".json")
-        with os.fdopen(fd, "w") as f:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.fixture = os.path.join(self.tmp.name, "session.json")
+        with open(self.fixture, "w") as f:
             json.dump(FIXTURE, f)
+        herdr = os.path.join(self.tmp.name, "herdr")
+        with open(herdr, "w") as f:
+            f.write(f"#!/bin/sh\necho '{json.dumps(HERDR_PANES)}'\n")
+        os.chmod(herdr, 0o755)
 
     def tearDown(self):
-        os.remove(self.fixture)
+        self.tmp.cleanup()
         subprocess.run([REX, "kill", LABEL], capture_output=True)
 
     def run_import(self):
+        env = {**os.environ, "PATH": f"{self.tmp.name}:{os.environ['PATH']}"}
         return subprocess.run([os.path.join(HERE, "herdr2rex"), "--from", self.fixture],
-                              check=True, capture_output=True, text=True).stdout
+                              env=env, check=True, capture_output=True, text=True).stdout
 
     def wait_for(self, block, text):
         deadline = time.time() + 10
@@ -88,6 +97,10 @@ class ImportTest(unittest.TestCase):
         self.wait_for(inner["before"]["block_id"], f"claude --resume {CLAUDE_ID}")
         self.wait_for(inner["after"]["block_id"], "copilot --resume=copilot-1")
         self.assertNotIn("amp-1", rex("capture", "-b", root["after"]["block_id"]))
+
+        labels = {b["block_id"]: b["label"] for b in layer["blocks"]}
+        self.assertEqual(labels[inner["before"]["block_id"]], TITLE)
+        self.assertEqual(labels[inner["after"]["block_id"]], "shell")
 
         self.assertIn(f"skip {LABEL}", self.run_import())
 
