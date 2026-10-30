@@ -82,7 +82,7 @@ class ImportTest(unittest.TestCase):
 
     def wait_for(self, block, text):
         deadline = time.time() + 10
-        while text not in rex("capture", "-b", block):
+        while text not in rex("capture", "-s", LABEL, "-b", block):
             self.assertLess(time.time(), deadline, f"{text!r} never reached the shell")
             time.sleep(0.5)
 
@@ -104,7 +104,7 @@ class ImportTest(unittest.TestCase):
 
         self.wait_for(inner["before"]["block_id"], f"claude --resume {CLAUDE_ID}")
         self.wait_for(inner["after"]["block_id"], "copilot --resume=copilot-1")
-        self.assertNotIn("amp-1", rex("capture", "-b", root["after"]["block_id"]))
+        self.assertNotIn("amp-1", rex("capture", "-s", LABEL, "-b", root["after"]["block_id"]))
 
         labels = {b["block_id"]: b["label"] for b in layer["blocks"]}
         self.assertEqual(labels[inner["before"]["block_id"]], TITLE)
