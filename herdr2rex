@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Import herdr workspaces into Rex.
+"""Import herdr workspaces into Rex, or with --reverse, Rex sessions into herdr.
 
 herdr workspace -> Rex session, herdr tab -> Rex window, herdr pane -> Rex block.
 Panes that held an agent session resume it in their shell, the same way herdr does.
 Run it again to add the panes and tabs that are missing in Rex.
+--reverse writes herdr's session.json while herdr is stopped. herdr restores it on start.
 """
 import argparse
 import json
@@ -18,6 +19,8 @@ REX_DEFAULT = os.path.expanduser(
     "~/Library/Application Support/com.superlogical.rex/RexServer/Versions/Current/Rex Server.app/Contents/MacOS/rex"
 )
 STATE = os.path.join(os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state"), "herdr2rex", "state.json")
+CLAUDE_SESSIONS = os.path.join(os.environ.get("CLAUDE_CONFIG_DIR") or os.path.expanduser("~/.claude"), "sessions")
+PUBLIC_ID_ALPHABET = "123456789ABCDEFGHJKMNPQRSTVWXYZ0"  # herdr's src/workspace.rs
 DIRECTIONS = {"Horizontal": "right", "Vertical": "below"}
 OPPOSITE = {"right": "left", "below": "above"}
 # Copied from herdr's src/agent_resume.rs. Keys are the saved agent_session source.
@@ -48,6 +51,28 @@ def first_pane(node):
 
 def workspace_label(ws):
     return ws.get("custom_name") or os.path.basename(ws["identity_cwd"])
+
+
+def decode_public_number(text):
+    value = 0
+    for ch in text:
+        value = value * len(PUBLIC_ID_ALPHABET) + PUBLIC_ID_ALPHABET.index(ch) + 1
+    return value
+
+
+def encode_public_number(value):
+    text = ""
+    while value > 0:
+        value, digit = divmod(value - 1, len(PUBLIC_ID_ALPHABET))
+        text = PUBLIC_ID_ALPHABET[digit] + text
+    return text
+
+
+def herdr_running():
+    try:
+        return subprocess.run(["herdr", "workspace", "list"], capture_output=True).returncode == 0
+    except OSError:
+        return False
 
 
 def herdr_titles():
@@ -167,6 +192,68 @@ class Importer:
             self.call("send", "-s", session, "-b", block, command.format(shlex.quote(agent["value"])) + "\n")
 
 
+class Exporter:
+    """Builds herdr workspaces from live Rex sessions."""
+
+    def __init__(self, rex):
+        self.rex = rex
+
+    def run(self, *args):
+        return json.loads(subprocess.run([self.rex, *args], check=True, capture_output=True, text=True).stdout)
+
+    def workspace(self, session, entry):
+        """Build a herdr workspace from a Rex session. Updates entry to map its public pane numbers to blocks."""
+        info = self.run("session", "inspect", session, "--json")
+        # Keep the public numbers of panes that came from herdr, so a later import sees them as up to date.
+        numbers = {block: int(n) for n, block in entry["blocks"].items()}
+        public, blocks, tabs = {}, {}, []
+
+        def layout(node, panes):
+            if "block_id" in node:
+                block = node["block_id"]
+                numbers.setdefault(block, max(numbers.values(), default=0) + 1)
+                pane = len(public) + 1
+                public[str(pane)] = numbers[block]
+                blocks[str(numbers[block])] = block
+                panes[str(pane)] = self.pane(session, block)
+                return {"Pane": pane}
+            split = node["split"]
+            return {"Split": {"direction": split["direction"].capitalize(), "ratio": split["ratio"],
+                              "first": layout(split["before"], panes), "second": layout(split["after"], panes)}}
+
+        for window in info["windows"]:
+            tiled = next(layer for layer in window["layers"] if layer["kind"] == "tiled")
+            panes = {}
+            tree = layout(tiled["layout"], panes)
+            label = window["label"]
+            tabs.append({
+                "custom_name": None if label == "Window " + window["window_id"][-8:] else label,
+                "layout": tree, "panes": panes, "zoomed": False, "root_pane": first_pane(tree),
+            })
+        entry["blocks"] = blocks
+        windows = [w["window_id"] for w in info["windows"]]
+        return {
+            "custom_name": info["label"],
+            "identity_cwd": tabs[0]["panes"][str(tabs[0]["root_pane"])]["cwd"],
+            "public_pane_numbers": public,
+            "next_public_pane_number": max(public.values()) + 1,
+            "tabs": tabs,
+            "active_tab": windows.index(info["active_window_id"]) if info.get("active_window_id") in windows else 0,
+        }
+
+    def pane(self, session, block):
+        process = self.run("block", "call", "-s", session, "-b", block, "process")
+        foreground = process.get("foreground") or {}
+        pane = {"cwd": foreground.get("cwd") or process["home"]}
+        # Claude Code writes the session of each running process to <pid>.json.
+        claude = os.path.join(CLAUDE_SESSIONS, f"{foreground.get('pid')}.json")
+        if os.path.exists(claude):
+            with open(claude) as f:
+                value = json.load(f)["sessionId"]
+            pane["agent_session"] = {"source": "herdr:claude", "agent": "claude", "kind": "id", "value": value}
+        return pane
+
+
 def load_state():
     try:
         with open(STATE) as f:
@@ -181,16 +268,60 @@ def save_state(state):
         json.dump(state, f, indent=2)
 
 
-def main():
-    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("workspaces", nargs="*", help="labels of workspaces to import (default: all)")
-    parser.add_argument("--from", dest="source", default=HERDR_SESSION, help="herdr session.json to read")
-    parser.add_argument("--dry-run", action="store_true", help="print rex commands instead of running them")
-    args = parser.parse_args()
+def to_herdr(args, rex):
+    if not args.dry_run and herdr_running():
+        sys.exit("herdr is running. Stop it with `herdr server stop` first, or it overwrites session.json.")
+    try:
+        with open(args.herdr_file) as f:
+            herdr = json.load(f)
+    except FileNotFoundError:
+        herdr = {"version": 3, "workspaces": [], "active": None, "selected": 0}
+    exporter = Exporter(rex)
+    state = load_state()
+    workspaces = herdr["workspaces"]
+    workspace_of = {entry["session"]: wid for wid, entry in state.items()}
+    by_id = {ws["id"]: i for i, ws in enumerate(workspaces) if ws.get("id")}
+    by_label = {workspace_label(ws): i for i, ws in enumerate(workspaces)}
+    next_id = max((decode_public_number(ws["id"][1:]) for ws in workspaces if ws.get("id")), default=0) + 1
+    exported = []
 
-    with open(args.source) as f:
+    for session in exporter.run("ls", "--json")["sessions"]:
+        label, sid = session["label"], session["session_id"]
+        if args.workspaces and label not in args.workspaces:
+            continue
+        index = by_id.get(workspace_of.get(sid), by_label.get(label))
+        wid = workspaces[index].get("id") if index is not None else None
+        if not wid:
+            wid, next_id = "w" + encode_public_number(next_id), next_id + 1
+        old = state.get(wid)
+        entry = old if old and old["session"] == sid else {"session": sid, "blocks": {}}
+        ws = dict(exporter.workspace(sid, entry), id=wid)
+        if index is None:
+            workspaces.append(ws)
+        else:
+            workspaces[index] = ws
+        state[wid] = entry
+        exported.append(label)
+        if args.dry_run:
+            print(f"would {'export' if index is None else 'replace'} {label}")
+        else:
+            print(f"{'exported' if index is None else 'replaced'} {label}")
+
+    if args.dry_run or not exported:
+        return
+    if os.path.exists(args.herdr_file):
+        shutil.copyfile(args.herdr_file, args.herdr_file + ".bak")
+    with open(args.herdr_file, "w") as f:
+        json.dump(herdr, f, indent=2)
+    save_state(state)
+    print("Close these sessions in Rex before you start herdr, or each agent runs in both:")
+    print("  rex kill " + " ".join(shlex.quote(label) for label in exported))
+
+
+def to_rex(args, rex):
+    with open(args.herdr_file) as f:
         herdr = json.load(f)
-    importer = Importer(shutil.which("rex") or REX_DEFAULT, args.dry_run)
+    importer = Importer(rex, args.dry_run)
     existing = importer.existing_labels()
     state = load_state()
 
@@ -221,6 +352,18 @@ def main():
             print(f"{'would add' if args.dry_run else 'added'} {added} pane{'' if added == 1 else 's'} to {label}")
         else:
             print(f"{label} is up to date")
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("workspaces", nargs="*",
+                        help="herdr workspaces to import, or Rex sessions with --reverse (default: all)")
+    parser.add_argument("--reverse", action="store_true", help="copy Rex sessions into herdr instead")
+    parser.add_argument("--herdr-file", default=HERDR_SESSION, help="herdr's session.json")
+    parser.add_argument("--dry-run", action="store_true", help="print what would change instead of changing it")
+    args = parser.parse_args()
+    rex = shutil.which("rex") or REX_DEFAULT
+    to_herdr(args, rex) if args.reverse else to_rex(args, rex)
 
 
 if __name__ == "__main__":

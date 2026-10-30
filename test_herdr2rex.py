@@ -70,9 +70,13 @@ class ImportTest(unittest.TestCase):
         self.fixture = os.path.join(self.tmp.name, "session.json")
         self.state = os.path.join(self.tmp.name, "state")
         self.write_fixture(FIXTURE)
+        self.claude = os.path.join(self.tmp.name, "claude")
+        os.makedirs(os.path.join(self.claude, "sessions"))
+        # Fake herdr: answers `pane list`, and acts stopped unless FAKE_HERDR_EXIT=0.
         herdr = os.path.join(self.tmp.name, "herdr")
         with open(herdr, "w") as f:
-            f.write(f"#!/bin/sh\necho '{json.dumps(HERDR_PANES)}'\n")
+            f.write(f"#!/bin/sh\n[ \"$1\" = pane ] && echo '{json.dumps(HERDR_PANES)}' && exit 0\n"
+                    "exit ${FAKE_HERDR_EXIT:-1}\n")
         os.chmod(herdr, 0o755)
 
     def tearDown(self):
@@ -83,10 +87,30 @@ class ImportTest(unittest.TestCase):
         with open(self.fixture, "w") as f:
             json.dump(data, f)
 
+    def run_tool(self, *args, herdr_file=None, check=True, **env):
+        env = {**os.environ, "PATH": f"{self.tmp.name}:{os.environ['PATH']}",
+               "XDG_STATE_HOME": self.state, "CLAUDE_CONFIG_DIR": self.claude, **env}
+        return subprocess.run([os.path.join(HERE, "herdr2rex"), "--herdr-file", herdr_file or self.fixture, *args],
+                              env=env, check=check, capture_output=True, text=True)
+
     def run_import(self):
-        env = {**os.environ, "PATH": f"{self.tmp.name}:{os.environ['PATH']}", "XDG_STATE_HOME": self.state}
-        return subprocess.run([os.path.join(HERE, "herdr2rex"), "--from", self.fixture],
-                              env=env, check=True, capture_output=True, text=True).stdout
+        return self.run_tool().stdout
+
+    def run_reverse(self, herdr_file=None):
+        return self.run_tool("--reverse", LABEL, herdr_file=herdr_file).stdout
+
+    def fake_claude(self, block, session_id):
+        """Run a process in block and register it the way Claude Code registers its sessions."""
+        rex("send", "-s", LABEL, "-b", block, "sleep 300\n")
+        deadline = time.time() + 10
+        while True:
+            foreground = json.loads(rex("block", "call", "-s", LABEL, "-b", block, "process"))["foreground"]
+            if foreground["name"] == "sleep":
+                break
+            self.assertLess(time.time(), deadline, "sleep never started")
+            time.sleep(0.2)
+        with open(os.path.join(self.claude, "sessions", f"{foreground['pid']}.json"), "w") as f:
+            json.dump({"pid": foreground["pid"], "sessionId": session_id}, f)
 
     def wait_for(self, block, text):
         deadline = time.time() + 10
@@ -165,6 +189,53 @@ class ImportTest(unittest.TestCase):
         self.run_import()
         self.state = os.path.join(self.tmp.name, "other-state")
         self.assertIn(f"skip {LABEL}", self.run_import())
+
+
+    def test_reverse_replaces_the_herdr_workspace(self):
+        self.run_import()
+        root = inspect()["windows"][0]["layers"][0]["layout"]["split"]
+        self.fake_claude(root["after"]["block_id"], "rex-claude-1")
+
+        out = self.run_reverse()
+        self.assertIn(f"replaced {LABEL}", out)
+        self.assertIn(f"rex kill {LABEL}", out)
+        self.assertTrue(os.path.exists(self.fixture + ".bak"))
+        with open(self.fixture) as f:
+            (ws,) = json.load(f)["workspaces"]
+        self.assertEqual(ws["id"], "w1")
+        self.assertEqual(ws["custom_name"], LABEL)
+        self.assertEqual(sorted(ws["public_pane_numbers"].values()), [1, 2, 3, 4])
+        main, second = ws["tabs"]
+        self.assertEqual(main["custom_name"], "main")
+        self.assertIsNone(second["custom_name"])
+        split = main["layout"]["Split"]
+        self.assertEqual(split["direction"], "Horizontal")
+        self.assertAlmostEqual(split["ratio"], 0.6, places=5)
+        self.assertEqual(split["first"]["Split"]["direction"], "Vertical")
+        self.assertAlmostEqual(split["first"]["Split"]["ratio"], 0.7, places=5)
+        pane = main["panes"][str(split["second"]["Pane"])]
+        self.assertEqual(pane["cwd"], os.path.expanduser("~"))
+        self.assertEqual(pane["agent_session"], session("claude", "rex-claude-1"))
+
+        # The round trip keeps public pane numbers, so importing it again changes nothing.
+        self.assertIn(f"{LABEL} is up to date", self.run_import())
+
+    def test_reverse_exports_into_an_empty_herdr_file(self):
+        self.run_import()
+        herdr_file = os.path.join(self.tmp.name, "new", "session.json")
+        os.makedirs(os.path.dirname(herdr_file))
+
+        self.assertIn(f"exported {LABEL}", self.run_reverse(herdr_file))
+        with open(herdr_file) as f:
+            herdr = json.load(f)
+        self.assertEqual(herdr["version"], 3)
+        self.assertEqual([ws["custom_name"] for ws in herdr["workspaces"]], [LABEL])
+
+    def test_reverse_refuses_while_herdr_runs(self):
+        self.run_import()
+        result = self.run_tool("--reverse", LABEL, check=False, FAKE_HERDR_EXIT="0")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("herdr server stop", result.stderr)
 
 
 if __name__ == "__main__":
