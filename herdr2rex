@@ -98,11 +98,15 @@ class Importer:
         """Create every pane of ws that has no live block in Rex. Returns how many were created."""
         self.entry = entry
         self.panes = {k: v for tab in ws["tabs"] for k, v in tab["panes"].items()}
+        # herdr gives panes new internal IDs on every restart, but keeps their public numbers.
+        numbers = ws.get("public_pane_numbers", {})
+        self.key = lambda pane: str(numbers.get(str(pane), pane))
         self.added = 0
         for tab in ws["tabs"]:
             if self.sync(tab["layout"], live) is None:
                 self.new_window(ws, tab)
-        entry["blocks"] = {k: v for k, v in entry["blocks"].items() if k in self.panes}
+        keep = {self.key(pane) for pane in self.panes}
+        entry["blocks"] = {k: v for k, v in entry["blocks"].items() if k in keep}
         return self.added
 
     def new_window(self, ws, tab):
@@ -121,7 +125,7 @@ class Importer:
     def sync(self, node, live):
         """Add the missing parts of node next to its live blocks. Returns a live block in node, or None."""
         if "Pane" in node:
-            block = self.entry["blocks"].get(str(node["Pane"]))
+            block = self.entry["blocks"].get(self.key(node["Pane"]))
             return block if block in live else None
         split = node["Split"]
         first = self.sync(split["first"], live)
@@ -151,7 +155,7 @@ class Importer:
         self.build(node, res["block_ids"][0])
 
     def start(self, pane, block):
-        self.entry["blocks"][pane] = block
+        self.entry["blocks"][self.key(pane)] = block
         self.added += 1
         session = self.entry["session"]
         agent = self.panes[pane].get("agent_session") or {}

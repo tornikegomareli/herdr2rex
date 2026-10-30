@@ -29,6 +29,7 @@ FIXTURE = {
         "id": "w1",
         "custom_name": LABEL,
         "identity_cwd": "/tmp",
+        "public_pane_numbers": {"1": 1, "2": 2, "3": 3, "4": 4},
         "tabs": [
             {
                 "custom_name": "main",
@@ -46,6 +47,13 @@ FIXTURE = {
         ],
     }],
 }
+
+
+def renumber(node, offset):
+    if "Pane" in node:
+        return {"Pane": node["Pane"] + offset}
+    split = node["Split"]
+    return {"Split": {**split, "first": renumber(split["first"], offset), "second": renumber(split["second"], offset)}}
 
 
 def rex(*args):
@@ -128,6 +136,19 @@ class ImportTest(unittest.TestCase):
         self.assertEqual(split["direction"], "vertical")
         self.assertAlmostEqual(split["ratio"], 0.6)
         self.assertEqual(windows[2]["label"], "logs")
+
+    def test_rerun_after_herdr_restart_is_up_to_date(self):
+        self.run_import()
+        # A herdr restart gives every pane a new internal ID and keeps its public number.
+        restarted = copy.deepcopy(FIXTURE)
+        ws = restarted["workspaces"][0]
+        ws["public_pane_numbers"] = {str(int(k) + 100): n for k, n in ws["public_pane_numbers"].items()}
+        for tab in ws["tabs"]:
+            tab["layout"] = renumber(tab["layout"], 100)
+            tab["panes"] = {str(int(k) + 100): pane for k, pane in tab["panes"].items()}
+        self.write_fixture(restarted)
+
+        self.assertIn(f"{LABEL} is up to date", self.run_import())
 
     def test_rerun_restores_a_closed_block(self):
         self.run_import()
