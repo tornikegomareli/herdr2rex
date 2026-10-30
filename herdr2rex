@@ -1,0 +1,115 @@
+#!/usr/bin/env python3
+"""Import herdr workspaces into Rex.
+
+herdr workspace -> Rex session, herdr tab -> Rex window, herdr pane -> Rex block.
+Panes that held a Claude session run `claude --resume <id>` in their shell.
+Workspaces whose label already exists in Rex are skipped.
+"""
+import argparse
+import json
+import os
+import shlex
+import shutil
+import subprocess
+import sys
+
+HERDR_SESSION = os.path.expanduser("~/.config/herdr/session.json")
+REX_DEFAULT = os.path.expanduser(
+    "~/Library/Application Support/com.superlogical.rex/RexServer/Versions/Current/Rex Server.app/Contents/MacOS/rex"
+)
+DIRECTIONS = {"Horizontal": "right", "Vertical": "below"}
+
+
+def first_pane(node):
+    return node["Pane"] if "Pane" in node else first_pane(node["Split"]["first"])
+
+
+def workspace_label(ws):
+    return ws.get("custom_name") or os.path.basename(ws["identity_cwd"])
+
+
+class Importer:
+    def __init__(self, rex, dry_run):
+        self.rex = rex
+        self.dry_run = dry_run
+        self.fake_ids = 0
+
+    def call(self, *args):
+        if self.dry_run:
+            print("rex " + shlex.join(args).replace("\n", "\\n"))
+            if "--json" not in args:
+                return None
+            self.fake_ids += 1
+            block = f"block{self.fake_ids}"
+            return {"session_id": "SESSION", "block_ids": [block], "initial_windows": [{"block_ids": [block]}]}
+        out = subprocess.run([self.rex, *args], check=True, capture_output=True, text=True).stdout
+        return json.loads(out) if "--json" in args else None
+
+    def existing_labels(self):
+        out = subprocess.run([self.rex, "ls", "--json"], check=True, capture_output=True, text=True).stdout
+        return {s["label"] for s in json.loads(out)["sessions"]}
+
+    def import_workspace(self, ws):
+        label = workspace_label(ws)
+        session = None
+        for tab in ws["tabs"]:
+            panes = tab["panes"]
+            cwd = panes[str(first_pane(tab["layout"]))]["cwd"]
+            name = [tab["custom_name"]] if tab.get("custom_name") else []
+            if session is None:
+                window = ["--window", *name] if name else []
+                res = self.call("new", label, *window, "-c", cwd, "--json")
+                session = res["session_id"]
+                block = res["initial_windows"][0]["block_ids"][0]
+            else:
+                res = self.call("window", "new", "-s", session, *name, "-c", cwd, "--focus=false", "--json")
+                block = res["block_ids"][0]
+            self.build(tab["layout"], block, session, panes)
+
+    def build(self, node, block, session, panes):
+        if "Pane" in node:
+            agent = panes[str(node["Pane"])].get("agent_session") or {}
+            if agent.get("agent") == "claude" and agent.get("kind") == "id":
+                self.call("send", "-s", session, "-b", block, f"claude --resume {agent['value']}\n")
+            return
+        split = node["Split"]
+        cwd = panes[str(first_pane(split["second"]))]["cwd"]
+        res = self.call(
+            "split", "-s", session, "-b", block,
+            "--split", DIRECTIONS[split["direction"]],
+            "--ratio", str(round((1 - split["ratio"]) * 100)),
+            "-c", cwd, "--focus=false", "--json",
+        )
+        self.build(split["first"], block, session, panes)
+        self.build(split["second"], res["block_ids"][0], session, panes)
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("workspaces", nargs="*", help="labels of workspaces to import (default: all)")
+    parser.add_argument("--from", dest="source", default=HERDR_SESSION, help="herdr session.json to read")
+    parser.add_argument("--dry-run", action="store_true", help="print rex commands instead of running them")
+    args = parser.parse_args()
+
+    with open(args.source) as f:
+        herdr = json.load(f)
+    importer = Importer(shutil.which("rex") or REX_DEFAULT, args.dry_run)
+    existing = set() if args.dry_run else importer.existing_labels()
+
+    for ws in herdr["workspaces"]:
+        label = workspace_label(ws)
+        if args.workspaces and label not in args.workspaces:
+            continue
+        if label in existing:
+            print(f"skip {label}: already in Rex")
+            continue
+        try:
+            importer.import_workspace(ws)
+        except subprocess.CalledProcessError as e:
+            sys.exit(f"failed on {label}: {e.stderr.strip()}")
+        existing.add(label)
+        print(f"{'would import' if args.dry_run else 'imported'} {label}")
+
+
+if __name__ == "__main__":
+    main()
